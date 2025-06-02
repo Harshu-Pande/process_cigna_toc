@@ -178,14 +178,32 @@ func (e *Extractor) downloadWithRetry(url string, maxRetries int) ([]byte, error
 	return nil, fmt.Errorf("failed after %d retries: %v", maxRetries, lastErr)
 }
 
+// ErrorDetails represents error information for a URL
+type ErrorDetails struct {
+	URL          string `json:"url"`
+	ErrorType    string `json:"error_type"`
+	ErrorMessage string `json:"error_message"`
+	FailedIDs    []int  `json:"failed_provider_ids,omitempty"`
+	AttemptedAt  string `json:"attempted_at"`
+}
+
 // ProcessURL downloads and processes a URL
 func (e *Extractor) ProcessURL(url string) error {
 	fmt.Printf("Processing URL: %s\n", url)
 
+	// Create error details in case we need it
+	errorDetails := ErrorDetails{
+		URL:         url,
+		AttemptedAt: time.Now().Format(time.RFC3339),
+	}
+
 	// Download file with retries
-	body, err := e.downloadWithRetry(url, 3)
-	if err != nil {
-		return err
+	body, downloadErr := e.downloadWithRetry(url, 3)
+	if downloadErr != nil {
+		errorDetails.ErrorType = "download_failed"
+		errorDetails.ErrorMessage = downloadErr.Error()
+		e.saveErrorDetails(errorDetails)
+		return downloadErr
 	}
 
 	var reader io.Reader
@@ -195,18 +213,24 @@ func (e *Extractor) ProcessURL(url string) error {
 	switch {
 	case strings.HasSuffix(fileURL, ".gz"):
 		// Handle gzip
-		gzReader, err := gzip.NewReader(bytes.NewReader(body))
-		if err != nil {
-			return fmt.Errorf("failed to create gzip reader: %v", err)
+		gzReader, gzipErr := gzip.NewReader(bytes.NewReader(body))
+		if gzipErr != nil {
+			errorDetails.ErrorType = "gzip_error"
+			errorDetails.ErrorMessage = gzipErr.Error()
+			e.saveErrorDetails(errorDetails)
+			return fmt.Errorf("failed to create gzip reader: %v", gzipErr)
 		}
 		defer gzReader.Close()
 		reader = gzReader
 
 	case strings.HasSuffix(fileURL, ".zip"):
 		// Handle ZIP
-		zipReader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
-		if err != nil {
-			return fmt.Errorf("failed to create zip reader: %v", err)
+		zipReader, zipErr := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+		if zipErr != nil {
+			errorDetails.ErrorType = "zip_error"
+			errorDetails.ErrorMessage = zipErr.Error()
+			e.saveErrorDetails(errorDetails)
+			return fmt.Errorf("failed to create zip reader: %v", zipErr)
 		}
 
 		// Find the first JSON file in the ZIP
@@ -219,20 +243,29 @@ func (e *Extractor) ProcessURL(url string) error {
 		}
 
 		if jsonFile == nil {
+			errorDetails.ErrorType = "zip_error"
+			errorDetails.ErrorMessage = "no JSON file found in ZIP archive"
+			e.saveErrorDetails(errorDetails)
 			return fmt.Errorf("no JSON file found in ZIP archive")
 		}
 
 		// Open the JSON file from the ZIP
-		rc, err := jsonFile.Open()
-		if err != nil {
-			return fmt.Errorf("failed to open JSON file from ZIP: %v", err)
+		rc, openErr := jsonFile.Open()
+		if openErr != nil {
+			errorDetails.ErrorType = "zip_error"
+			errorDetails.ErrorMessage = openErr.Error()
+			e.saveErrorDetails(errorDetails)
+			return fmt.Errorf("failed to open JSON file from ZIP: %v", openErr)
 		}
 		defer rc.Close()
 
 		// Read the JSON content
-		jsonContent, err := io.ReadAll(rc)
-		if err != nil {
-			return fmt.Errorf("failed to read JSON from ZIP: %v", err)
+		jsonContent, readErr := io.ReadAll(rc)
+		if readErr != nil {
+			errorDetails.ErrorType = "read_error"
+			errorDetails.ErrorMessage = readErr.Error()
+			e.saveErrorDetails(errorDetails)
+			return fmt.Errorf("failed to read JSON from ZIP: %v", readErr)
 		}
 		reader = bytes.NewReader(jsonContent)
 
@@ -246,11 +279,21 @@ func (e *Extractor) ProcessURL(url string) error {
 	decoder.UseNumber()
 
 	// Determine format based on URL
+	var processErr error
 	if strings.Contains(url, "oscar") {
-		return e.processOscarFormat(decoder, url)
+		processErr = e.processOscarFormat(decoder, url)
 	} else {
-		return e.processCignaFormat(decoder, url)
+		processErr = e.processCignaFormat(decoder, url)
 	}
+
+	if processErr != nil {
+		errorDetails.ErrorType = "processing_error"
+		errorDetails.ErrorMessage = processErr.Error()
+		e.saveErrorDetails(errorDetails)
+		return processErr
+	}
+
+	return nil
 }
 
 // ProcessFile processes a file and extracts provider references
@@ -363,6 +406,11 @@ func (e *Extractor) processOscarFormat(decoder *json.Decoder, source string) err
 func (e *Extractor) fetchRemoteReferences(refs []models.RemoteProviderReference) ([]models.ProviderReference, []error) {
 	results := make(chan models.ProviderReference, len(refs))
 	errors := make(chan error, len(refs))
+
+	// Create error details for this batch
+	errorDetails := ErrorDetails{
+		AttemptedAt: time.Now().Format(time.RFC3339),
+	}
 
 	// Create a worker pool with increased size
 	sem := make(chan struct{}, e.maxProviderWorkers)
@@ -519,6 +567,25 @@ func (e *Extractor) fetchRemoteReferences(refs []models.RemoteProviderReference)
 			}
 		}
 
+		// Save error details
+		for errType, ids := range errorsByType {
+			errorDetails.ErrorType = errType
+			errorDetails.FailedIDs = ids
+			switch errType {
+			case "empty_url":
+				errorDetails.ErrorMessage = fmt.Sprintf("%d references had empty URLs", len(ids))
+			case "invalid_scheme":
+				errorDetails.ErrorMessage = fmt.Sprintf("%d references had invalid URL schemes", len(ids))
+			case "fetch_failed":
+				errorDetails.ErrorMessage = fmt.Sprintf("%d references failed to fetch", len(ids))
+			case "decode_failed":
+				errorDetails.ErrorMessage = fmt.Sprintf("%d references failed to decode", len(ids))
+			default:
+				errorDetails.ErrorMessage = fmt.Sprintf("%d other errors", len(ids))
+			}
+			e.saveErrorDetails(errorDetails)
+		}
+
 		// Print error summary
 		fmt.Printf("\nError Summary:\n")
 		for errType, ids := range errorsByType {
@@ -630,4 +697,43 @@ func (e *Extractor) saveProviderReferences(providers []models.ProviderReference,
 
 	fmt.Printf("Successfully extracted %d provider references to: %s\n", len(providers), outputFile)
 	return nil
+}
+
+// saveErrorDetails saves error information to a JSON file
+func (e *Extractor) saveErrorDetails(details ErrorDetails) {
+	// Create error output directory if it doesn't exist
+	errorDir := filepath.Join(e.outputDir, "errors")
+	if err := os.MkdirAll(errorDir, 0755); err != nil {
+		fmt.Printf("Warning: Failed to create error directory: %v\n", err)
+		return
+	}
+
+	// Generate filename based on URL
+	urlBase := filepath.Base(strings.Split(details.URL, "?")[0])
+	errorFile := filepath.Join(errorDir, urlBase+"_error.json")
+
+	// Read existing errors if file exists
+	var errors []ErrorDetails
+	if data, err := os.ReadFile(errorFile); err == nil {
+		if jsonErr := json.Unmarshal(data, &errors); jsonErr != nil {
+			fmt.Printf("Warning: Failed to parse existing error file: %v\n", jsonErr)
+		}
+	}
+
+	// Append new error
+	errors = append(errors, details)
+
+	// Write to file
+	file, err := os.Create(errorFile)
+	if err != nil {
+		fmt.Printf("Warning: Failed to create error file: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if writeErr := encoder.Encode(errors); writeErr != nil {
+		fmt.Printf("Warning: Failed to write error details: %v\n", writeErr)
+	}
 }
