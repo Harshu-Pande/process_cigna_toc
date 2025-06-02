@@ -391,6 +391,17 @@ func (e *Extractor) fetchRemoteReferences(refs []models.RemoteProviderReference)
 			defer wg.Done()
 			defer reportProgress()
 
+			// Validate URL before processing
+			if ref.Location == "" {
+				errors <- fmt.Errorf("empty location URL for provider group %d", ref.ProviderGroupID)
+				return
+			}
+
+			if !strings.HasPrefix(ref.Location, "http://") && !strings.HasPrefix(ref.Location, "https://") {
+				errors <- fmt.Errorf("invalid URL scheme for provider group %d: %s", ref.ProviderGroupID, ref.Location)
+				return
+			}
+
 			// Acquire semaphore
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -479,6 +490,50 @@ func (e *Extractor) fetchRemoteReferences(refs []models.RemoteProviderReference)
 		// Break when both channels are closed
 		if results == nil && errors == nil {
 			break
+		}
+	}
+
+	// Group and summarize errors by type
+	if len(errs) > 0 {
+		errorsByType := make(map[string][]int)
+		for _, err := range errs {
+			errType := "other"
+			if strings.Contains(err.Error(), "empty location URL") {
+				errType = "empty_url"
+			} else if strings.Contains(err.Error(), "invalid URL scheme") {
+				errType = "invalid_scheme"
+			} else if strings.Contains(err.Error(), "failed to fetch") {
+				errType = "fetch_failed"
+			} else if strings.Contains(err.Error(), "failed to decode") {
+				errType = "decode_failed"
+			}
+
+			// Extract provider group ID from error message
+			var id int
+			if _, err := fmt.Sscanf(err.Error(), "failed to fetch %d", &id); err == nil {
+				errorsByType[errType] = append(errorsByType[errType], id)
+			} else if _, err := fmt.Sscanf(err.Error(), "empty location URL for provider group %d", &id); err == nil {
+				errorsByType[errType] = append(errorsByType[errType], id)
+			} else if _, err := fmt.Sscanf(err.Error(), "invalid URL scheme for provider group %d", &id); err == nil {
+				errorsByType[errType] = append(errorsByType[errType], id)
+			}
+		}
+
+		// Print error summary
+		fmt.Printf("\nError Summary:\n")
+		for errType, ids := range errorsByType {
+			switch errType {
+			case "empty_url":
+				fmt.Printf("- %d references had empty URLs\n", len(ids))
+			case "invalid_scheme":
+				fmt.Printf("- %d references had invalid URL schemes\n", len(ids))
+			case "fetch_failed":
+				fmt.Printf("- %d references failed to fetch\n", len(ids))
+			case "decode_failed":
+				fmt.Printf("- %d references failed to decode\n", len(ids))
+			default:
+				fmt.Printf("- %d other errors\n", len(ids))
+			}
 		}
 	}
 
