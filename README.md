@@ -36,8 +36,7 @@ export PATH=$PATH:/usr/local/go/bin
 # Navigate to the project directory
 cd /content/process_cigna_toc
 
-# Initialize Go modules
-go mod init provider-extractor
+# Download dependencies
 go mod tidy
 
 # Create output directory
@@ -57,7 +56,7 @@ The program will:
 
 Each output file will contain:
 - Provider group IDs
-- NPIs (National Provider Identifiers)
+- NPIs (National Provider Identifiers, can be either strings or numbers)
 - TIN (Tax Identification Number) information
 
 ## Supported File Formats
@@ -93,7 +92,7 @@ The extracted provider references will be in this format:
     "provider_group_id": 1,
     "provider_groups": [
       {
-        "npi": ["1234567890"],
+        "npi": ["1234567890"],  // NPIs can be strings or numbers
         "tin": {
           "type": "ein",
           "value": "123456789"
