@@ -4,30 +4,48 @@ This tool extracts provider references from Cigna's in-network rate files, suppo
 
 ## Google Colab Instructions
 
-Follow these steps to run the code in Google Colab. Each section represents a cell you can copy and paste directly into Colab.
+Follow these steps to run the code in Google Colab. Copy each cell exactly as shown and run them in sequence.
 
-### 1. Clone the Repository
-```bash
-!git clone https://github.com/Harshu-Pande/process_cigna_toc.git
-%cd process_cigna_toc
+### Cell 1: Install Go
+```python
+%%shell
+# Remove any existing Go installation
+rm -rf /usr/local/go
+
+# Download and install Go 1.22.0
+wget https://go.dev/dl/go1.22.0.linux-amd64.tar.gz
+tar -C /usr/local -xzf go1.22.0.linux-amd64.tar.gz
+export PATH=$PATH:/usr/local/go/bin
+go version
 ```
 
-### 2. Set up Go Environment
-```bash
-!apt-get update
-!apt-get install -y golang
-!go version
+### Cell 2: Clone the Repository
+```python
+%%shell
+# Clone the repository and navigate to it
+git clone https://github.com/Harshu-Pande/process_cigna_toc.git
+cd process_cigna_toc
 ```
 
-### 3. Initialize Go Module
-```bash
-!go mod init provider-extractor
-!go mod tidy
-```
+### Cell 3: Build and Run the Extractor
+```python
+%%shell
+# Set up Go environment
+export PATH=$PATH:/usr/local/go/bin
 
-### 4. Run the Extractor
-```bash
-!go run cmd/extract/main.go -csv clean_in_network_locations.csv
+# Navigate to the project directory
+cd /content/process_cigna_toc
+
+# Initialize Go modules
+go mod init provider-extractor
+go mod tidy
+
+# Create output directory
+mkdir -p extracted_providers
+
+# Build and run the extractor
+go build -o provider-extractor cmd/extract/main.go
+./provider-extractor -csv clean_in_network_locations.csv
 ```
 
 ## Output
