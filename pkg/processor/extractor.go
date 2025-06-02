@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,11 @@ import (
 type Extractor struct {
 	outputDir string
 	client    *http.Client
+	// Configuration for concurrency
+	maxURLWorkers      int
+	maxProviderWorkers int
+	maxConcurrentFiles int
+	maxRetriesPerURL   int
 }
 
 // NewExtractor creates a new Extractor instance
@@ -30,12 +36,15 @@ func NewExtractor(outputDir string) (*Extractor, error) {
 		return nil, fmt.Errorf("failed to create output directory: %v", err)
 	}
 
+	// Calculate optimal concurrency based on available CPU cores
+	numCPU := runtime.NumCPU()
+
 	// Create HTTP client with improved configuration for large files
 	client := &http.Client{
 		Timeout: 5 * time.Minute, // Increased timeout for large files
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
+			MaxIdleConns:        numCPU * 10, // Scale with CPU count
+			MaxIdleConnsPerHost: numCPU * 10,
 			IdleConnTimeout:     90 * time.Second,
 			DisableKeepAlives:   false,
 			DisableCompression:  false,
@@ -44,9 +53,70 @@ func NewExtractor(outputDir string) (*Extractor, error) {
 	}
 
 	return &Extractor{
-		outputDir: outputDir,
-		client:    client,
+		outputDir:          outputDir,
+		client:             client,
+		maxURLWorkers:      numCPU,     // Process URLs concurrently
+		maxProviderWorkers: numCPU * 4, // More workers for provider fetching
+		maxConcurrentFiles: 10,         // Limit concurrent file operations
+		maxRetriesPerURL:   3,          // Maximum retries per URL
 	}, nil
+}
+
+// ProcessURLs processes multiple URLs concurrently
+func (e *Extractor) ProcessURLs(urls []string) error {
+	fmt.Printf("Processing %d URLs using %d workers...\n", len(urls), e.maxURLWorkers)
+
+	// Create channels for work distribution and error collection
+	urlChan := make(chan string, len(urls))
+	errorChan := make(chan error, len(urls))
+	var wg sync.WaitGroup
+
+	// Create semaphore to limit concurrent file operations
+	fileSem := make(chan struct{}, e.maxConcurrentFiles)
+
+	// Start worker pool
+	for i := 0; i < e.maxURLWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for url := range urlChan {
+				// Acquire semaphore before file operations
+				fileSem <- struct{}{}
+				err := e.ProcessURL(url)
+				<-fileSem // Release semaphore
+
+				if err != nil {
+					errorChan <- fmt.Errorf("worker %d failed processing %s: %v", workerID, url, err)
+				}
+			}
+		}(i)
+	}
+
+	// Feed URLs to workers
+	for _, url := range urls {
+		urlChan <- url
+	}
+	close(urlChan)
+
+	// Wait for all workers to finish
+	wg.Wait()
+	close(errorChan)
+
+	// Collect and report errors
+	var errors []error
+	for err := range errorChan {
+		errors = append(errors, err)
+	}
+
+	if len(errors) > 0 {
+		fmt.Printf("\nEncountered %d errors while processing URLs:\n", len(errors))
+		for _, err := range errors {
+			fmt.Printf("  %v\n", err)
+		}
+	}
+
+	fmt.Printf("\nProcessing complete! Successfully processed %d/%d URLs\n", len(urls)-len(errors), len(urls))
+	return nil
 }
 
 // downloadWithRetry attempts to download a URL with retries
@@ -291,29 +361,27 @@ func (e *Extractor) processOscarFormat(decoder *json.Decoder, source string) err
 
 // fetchRemoteReferences fetches a batch of remote provider references
 func (e *Extractor) fetchRemoteReferences(refs []models.RemoteProviderReference) ([]models.ProviderReference, []error) {
-	// Create a transport with optimized settings
-	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-		DisableKeepAlives:   false,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
-	}
-
-	// Create a client with the optimized transport
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
-	}
-
-	// Create channels for results and errors
 	results := make(chan models.ProviderReference, len(refs))
 	errors := make(chan error, len(refs))
 
-	// Create a worker pool
-	maxWorkers := 50 // Increased from 10 to 50
-	sem := make(chan struct{}, maxWorkers)
+	// Create a worker pool with increased size
+	sem := make(chan struct{}, e.maxProviderWorkers)
+
+	// Progress tracking
+	var processed int64
+	var mu sync.Mutex
+	total := len(refs)
+	lastProgress := time.Now()
+	reportProgress := func() {
+		mu.Lock()
+		processed++
+		if time.Since(lastProgress) >= 5*time.Second {
+			fmt.Printf("Progress: %d/%d references (%.1f%%) processed...\n",
+				processed, total, float64(processed)/float64(total)*100)
+			lastProgress = time.Now()
+		}
+		mu.Unlock()
+	}
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -321,6 +389,7 @@ func (e *Extractor) fetchRemoteReferences(refs []models.RemoteProviderReference)
 		wg.Add(1)
 		go func(ref models.RemoteProviderReference) {
 			defer wg.Done()
+			defer reportProgress()
 
 			// Acquire semaphore
 			sem <- struct{}{}
@@ -336,20 +405,31 @@ func (e *Extractor) fetchRemoteReferences(refs []models.RemoteProviderReference)
 			// Add headers
 			req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 			req.Header.Set("Accept", "*/*")
+			req.Header.Set("Accept-Encoding", "gzip, deflate")
 			req.Header.Set("Connection", "keep-alive")
+			req.Header.Set("Cache-Control", "no-cache")
 
-			// Make the request
-			resp, err := client.Do(req)
-			if err != nil {
-				errors <- fmt.Errorf("failed to fetch %d: %v", ref.ProviderGroupID, err)
+			// Make the request with retries
+			var resp *http.Response
+			var lastErr error
+			for attempt := 0; attempt < e.maxRetriesPerURL; attempt++ {
+				if attempt > 0 {
+					time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+				}
+				resp, err = e.client.Do(req)
+				if err == nil && resp.StatusCode == http.StatusOK {
+					break
+				}
+				if resp != nil {
+					resp.Body.Close()
+				}
+				lastErr = err
+			}
+			if lastErr != nil {
+				errors <- fmt.Errorf("failed to fetch %d after %d retries: %v", ref.ProviderGroupID, e.maxRetriesPerURL, lastErr)
 				return
 			}
 			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				errors <- fmt.Errorf("received non-200 status code for %d: %d", ref.ProviderGroupID, resp.StatusCode)
-				return
-			}
 
 			// Decode the response
 			var provRef models.ProviderReference
@@ -375,15 +455,9 @@ func (e *Extractor) fetchRemoteReferences(refs []models.RemoteProviderReference)
 	var providers []models.ProviderReference
 	var errs []error
 
-	// Use a ticker for progress updates
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	processed := 0
-	total := len(refs)
-
-	// Create a buffer for providers to reduce memory allocations
-	providers = make([]models.ProviderReference, 0, total)
+	// Pre-allocate slices for better performance
+	providers = make([]models.ProviderReference, 0, len(refs))
+	errs = make([]error, 0)
 
 	// Process results as they come in
 	for {
@@ -394,19 +468,12 @@ func (e *Extractor) fetchRemoteReferences(refs []models.RemoteProviderReference)
 				continue
 			}
 			providers = append(providers, result)
-			processed++
 		case err, ok := <-errors:
 			if !ok {
 				errors = nil
 				continue
 			}
 			errs = append(errs, err)
-			processed++
-		case <-ticker.C:
-			if processed > 0 {
-				fmt.Printf("Progress: %d/%d references (%.1f%%) processed...\n",
-					processed, total, float64(processed)/float64(total)*100)
-			}
 		}
 
 		// Break when both channels are closed

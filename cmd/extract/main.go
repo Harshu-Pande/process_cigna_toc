@@ -49,20 +49,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Process each URL
+	// Collect URLs from CSV (skip header)
+	var urls []string
 	for i, record := range records {
 		if i == 0 || len(record) == 0 { // Skip header row
 			continue
 		}
-
-		url := record[0]
-		fmt.Printf("\nProcessing URL %d/%d: %s\n", i, len(records)-1, url)
-
-		if err := extractor.ProcessURL(url); err != nil {
-			fmt.Printf("Error processing URL: %v\n", err)
-			continue
-		}
+		urls = append(urls, record[0])
 	}
 
-	fmt.Println("\nProcessing complete!")
+	// Process URLs concurrently
+	fmt.Printf("Starting concurrent processing of %d URLs...\n", len(urls))
+	if err := extractor.ProcessURLs(urls); err != nil {
+		fmt.Printf("Error during processing: %v\n", err)
+		os.Exit(1)
+	}
 }
