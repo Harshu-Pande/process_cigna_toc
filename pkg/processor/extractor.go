@@ -30,9 +30,9 @@ func NewExtractor(outputDir string) (*Extractor, error) {
 		return nil, fmt.Errorf("failed to create output directory: %v", err)
 	}
 
-	// Create HTTP client with improved configuration
+	// Create HTTP client with improved configuration for large files
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 5 * time.Minute, // Increased timeout for large files
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 100,
@@ -49,37 +49,73 @@ func NewExtractor(outputDir string) (*Extractor, error) {
 	}, nil
 }
 
+// downloadWithRetry attempts to download a URL with retries
+func (e *Extractor) downloadWithRetry(url string, maxRetries int) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 2, 4, 8 seconds
+			backoff := time.Duration(1<<uint(attempt)) * time.Second
+			time.Sleep(backoff)
+			fmt.Printf("Retry attempt %d/%d for URL: %s\n", attempt, maxRetries, url)
+		}
+
+		// Create request with browser-like headers
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to create request: %v", err)
+			continue
+		}
+
+		// Add headers to mimic a browser
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Accept-Encoding", "gzip, deflate")
+		req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Pragma", "no-cache")
+
+		// Make the request
+		resp, err := e.client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to download file: %v", err)
+			continue
+		}
+
+		// Check status code
+		if resp.StatusCode == http.StatusForbidden {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("access denied (403) - URL may require authentication or be expired")
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("received non-200 status code: %d", resp.StatusCode)
+			continue
+		}
+
+		// Read body with progress reporting for large files
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %v", err)
+			continue
+		}
+
+		return body, nil
+	}
+
+	return nil, fmt.Errorf("failed after %d retries: %v", maxRetries, lastErr)
+}
+
 // ProcessURL downloads and processes a URL
 func (e *Extractor) ProcessURL(url string) error {
 	fmt.Printf("Processing URL: %s\n", url)
 
-	// Create request with browser-like headers
-	req, err := http.NewRequest("GET", url, nil)
+	// Download file with retries
+	body, err := e.downloadWithRetry(url, 3)
 	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
-	}
-
-	// Add headers to mimic a browser, but don't request gzip encoding
-	// since we'll handle it ourselves based on file extension
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Connection", "keep-alive")
-
-	// Make the request
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to download file: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("received non-200 status code: %d", resp.StatusCode)
-	}
-
-	// Read the entire response for ZIP files
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %v", err)
+		return err
 	}
 
 	var reader io.Reader
